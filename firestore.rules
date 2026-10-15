@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function validTeam(t) { return t in ['中央学院','東海','神奈川','東洋','日本体育','東京国際','山梨学院','東京農業','大東文化','立教','法政','明治','専修','国士舘']; }
+    match /events/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['university','capturedAtMs','localCapturedAtMs','clockOffsetMs','clockOffsetKnown','uid','status','createdAt'])
+        && validTeam(request.resource.data.university)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'active'
+        && request.resource.data.capturedAtMs is number
+        && request.resource.data.localCapturedAtMs is number
+        && request.resource.data.clockOffsetMs is number
+        && request.resource.data.clockOffsetKnown is bool
+        && request.resource.data.createdAt == request.time;
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['university','status','editedAt','editedBy'])
+        && validTeam(request.resource.data.university)
+        && request.resource.data.status in ['active','deleted']
+        && request.resource.data.editedBy == request.auth.uid
+        && request.resource.data.editedAt == request.time;
+      allow delete: if false;
+    }
+    match /clockSync/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid','serverTime'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.serverTime == request.time;
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
