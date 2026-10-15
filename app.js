@@ -13,7 +13,9 @@ import {
   collection,
   onSnapshot,
   serverTimestamp,
-  getDoc
+  getDoc,
+  getDocFromServer,
+  runTransaction
 } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js';
 
 import { firebaseConfig } from './firebase-config.js';
@@ -35,10 +37,16 @@ let auth;
 let user = null;
 let events = [];
 let queue = [];
-let unsubscribe = null;
+let unsubscribeEvents = null;
+let unsubscribeRace = null;
 let sending = false;
+let starting = false;
 let offset = 0;
 let offsetKnown = false;
+
+// STARTの状態
+let raceLoaded = false;
+let raceStartedAtMs = null;
 
 // 未送信データを復元
 try {
@@ -66,6 +74,7 @@ const esc = s => String(s ?? '').replace(
   }[c])
 );
 
+// 経過時間：分:秒.小数1桁
 const fmt = ms => {
   if (!Number.isFinite(ms)) return '—';
 
@@ -91,6 +100,18 @@ function setStatus(message) {
   $('connection').textContent = message;
 }
 
+function startTimeText(ms) {
+  return new Date(ms).toLocaleString('ja-JP', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    fractionalSecondDigits: 3
+  });
+}
+
 // 大学選択
 $('team').innerHTML =
   '<option value="">大学を選択してください</option>' +
@@ -105,22 +126,21 @@ $('team').onchange = () => {
   render();
 };
 
-// 有効なGOAL記録
+// 今回のレースの有効なGOAL記録
 function active() {
+  if (raceStartedAtMs === null) return [];
+
   return events.filter(e =>
     e.status === 'active' &&
     names.includes(e.university) &&
-    Number.isFinite(e.capturedAtMs)
+    Number.isFinite(e.capturedAtMs) &&
+    e.capturedAtMs >= raceStartedAtMs
   );
 }
 
-// 全大学共通の先頭GOAL時刻
+// 全端末共通のSTART時刻
 function baseline() {
-  const a = active();
-
-  return a.length
-    ? Math.min(...a.map(e => e.capturedAtMs))
-    : null;
+  return raceStartedAtMs;
 }
 
 // 同時刻の記録も安定した順序にする
@@ -136,7 +156,6 @@ function getTeamScores(a, b) {
       .filter(e => e.university === n)
       .sort(compareEvents);
 
-    // 先着10人だけが順位計算対象
     const topTen = list.slice(0, 10);
 
     const score = b === null
@@ -156,6 +175,34 @@ function getTeamScores(a, b) {
   });
 }
 
+// START状態の表示
+function renderRace() {
+  const button = $('start');
+
+  if (!raceLoaded || !user) {
+    $('raceStatus').textContent = '開始状態を確認中…';
+    $('startTime').textContent = '開始時刻：確認中';
+    button.disabled = true;
+    return;
+  }
+
+  if (raceStartedAtMs !== null) {
+    $('raceStatus').textContent = '🟢 レース進行中';
+    $('startTime').textContent =
+      '開始時刻：' + startTimeText(raceStartedAtMs);
+    button.disabled = true;
+    button.textContent = '✓ START済み';
+    return;
+  }
+
+  $('raceStatus').textContent = '⚪ レース開始前';
+  $('startTime').textContent = '開始時刻：未設定';
+  button.disabled = starting || !navigator.onLine;
+  button.textContent = starting
+    ? 'START処理中…'
+    : '🚩 START';
+}
+
 // 画面描画
 function render() {
   const a = active();
@@ -170,13 +217,22 @@ function render() {
   $('myCount').textContent = mine.length;
 
   saveQueue();
+  renderRace();
 
-  // 変更点：10人到達後もGOAL入力可能
-  $('goal').disabled = !user || !team;
+  // START前はGOAL不可
+  $('goal').disabled =
+    !user ||
+    !team ||
+    !raceLoaded ||
+    b === null;
 
   $('operatorTitle').textContent = team
     ? `${team}大学 GOAL`
     : '大学を選択してください';
+
+  $('timeNote').textContent = b === null
+    ? 'START後に共通の経過時間を計測します'
+    : 'FirebaseのSTART時刻を基準に計算（端末の時計補正は推定値）';
 
   const scores = getTeamScores(a, b);
 
@@ -210,7 +266,7 @@ function render() {
       </tr>
     `).join('');
 
-  // 自分が選択している大学の履歴
+  // 選択中の大学の履歴
   $('myLog').innerHTML = mine.map((e, i) => {
     const excluded = i >= 10;
 
@@ -265,7 +321,7 @@ function render() {
     `).join('') ||
     '<p class="muted">記録なし</p>';
 
-  // 大学の修正
+  // 大学変更
   document.querySelectorAll('[data-edit]').forEach(el => {
     el.onchange = async () => {
       const event = events.find(
@@ -325,6 +381,60 @@ function render() {
   });
 }
 
+// STARTボタン
+$('start').onclick = async () => {
+  if (!user || !db || !raceLoaded) {
+    return toast('接続状態を確認してください');
+  }
+
+  if (raceStartedAtMs !== null) {
+    return toast('レースはすでに開始しています');
+  }
+
+  if (!navigator.onLine) {
+    return toast('STARTにはインターネット接続が必要です');
+  }
+
+  if (starting) return;
+
+  if (!confirm(
+    'レースをSTARTしますか？\n\n' +
+    '最初のSTARTだけが有効です。\n' +
+    '開始後は時刻を変更できません。'
+  )) {
+    return;
+  }
+
+  starting = true;
+  renderRace();
+
+  try {
+    const raceRef = doc(db, 'raceControl', 'main');
+
+    // 既存STARTを確認し、未作成の場合だけ登録
+    await runTransaction(db, async transaction => {
+      const snap = await transaction.get(raceRef);
+
+      if (snap.exists()) {
+        throw new Error('すでにSTARTされています');
+      }
+
+      transaction.set(raceRef, {
+        startedAt: serverTimestamp(),
+        startedBy: user.uid,
+        createdAt: serverTimestamp()
+      });
+    });
+
+    toast('STARTを登録しました');
+  } catch (err) {
+    toast('STARTできません: ' + err.message);
+  } finally {
+    starting = false;
+    renderRace();
+  }
+};
+
 // Firebase初期化
 const configOK =
   !!firebaseConfig.apiKey &&
@@ -343,12 +453,19 @@ if (!configOK) {
     onAuthStateChanged(
       auth,
       async u => {
-        if (unsubscribe) {
-          unsubscribe();
-          unsubscribe = null;
+        if (unsubscribeEvents) {
+          unsubscribeEvents();
+          unsubscribeEvents = null;
+        }
+
+        if (unsubscribeRace) {
+          unsubscribeRace();
+          unsubscribeRace = null;
         }
 
         user = u;
+        raceLoaded = false;
+        raceStartedAtMs = null;
 
         if (!u) {
           setStatus('自動認証中…');
@@ -359,12 +476,41 @@ if (!configOK) {
             setStatus('認証エラー: ' + e.message);
           }
 
+          render();
           return;
         }
 
         setStatus('接続中…');
 
-        unsubscribe = onSnapshot(
+        // START状態を全端末にリアルタイム配信
+        unsubscribeRace = onSnapshot(
+          doc(db, 'raceControl', 'main'),
+          snap => {
+            // キャッシュだけの未作成判定ではSTARTを許可しない
+            if (snap.metadata.fromCache && !snap.exists()) {
+              raceLoaded = false;
+              render();
+              return;
+            }
+
+            raceLoaded = true;
+
+            const ts = snap.exists()
+              ? snap.data().startedAt
+              : null;
+
+            raceStartedAtMs = ts?.toMillis?.() ?? null;
+
+            render();
+          },
+          err => {
+            raceLoaded = false;
+            toast('START状態の取得失敗: ' + err.message);
+            render();
+          }
+        );
+
+        unsubscribeEvents = onSnapshot(
           collection(db, 'events'),
           snap => {
             events = snap.docs.map(d => ({
@@ -413,7 +559,8 @@ async function syncClock() {
         serverTime: serverTimestamp()
       });
 
-      const snap = await getDoc(ref);
+      // キャッシュではなくサーバーから取得
+      const snap = await getDocFromServer(ref);
 
       const t1 = Date.now();
       const ts = snap.data()?.serverTime;
@@ -452,13 +599,21 @@ $('goal').onclick = () => {
     return toast('大学を選択してください');
   }
 
-  // 変更点：10人以上でも記録を受け付ける
+  if (!raceLoaded || raceStartedAtMs === null) {
+    return toast('レースSTART前です');
+  }
+
   const local = Date.now();
+  const capturedAtMs = local + offset;
+
+  if (capturedAtMs < raceStartedAtMs) {
+    return toast('GOAL時刻がSTARTより前です。時計を確認してください');
+  }
 
   queue.push({
     id: crypto.randomUUID(),
     university: team,
-    capturedAtMs: local + offset,
+    capturedAtMs,
     localCapturedAtMs: local,
     clockOffsetMs: offset,
     clockOffsetKnown: offsetKnown,
@@ -503,9 +658,7 @@ async function resend() {
         queue = queue.filter(x => x.id !== id);
         saveQueue();
       } catch (err) {
-        toast(
-          '未送信として保存中: ' + err.message
-        );
+        toast('未送信として保存中: ' + err.message);
         break;
       }
     }
@@ -525,9 +678,14 @@ $('resend').onclick = async () => {
   );
 };
 
-window.addEventListener('online', resend);
+window.addEventListener('online', () => {
+  renderRace();
+  resend();
+});
 
-// 経過時間表示
+window.addEventListener('offline', renderRace);
+
+// STARTからの経過時間表示
 setInterval(() => {
   const b = baseline();
 
@@ -576,7 +734,7 @@ $('exportHistory').onclick = () => {
       [
         'ID',
         '大学',
-        '先頭差秒',
+        'STARTからの経過秒',
         '記録時刻',
         '担当UID',
         '状態',
@@ -618,7 +776,7 @@ $('exportRank').onclick = () => {
       [
         '大学',
         '人数',
-        '合計差秒',
+        '合計経過秒',
         '10人完了'
       ],
       ...teams.map(x => [
