@@ -1,1 +1,1 @@
-{"name":"予選会集計ツール Multi","short_name":"予選会Multi","start_url":"./index.html","scope":"./","display":"standalone","background_color":"#edf2f9","theme_color":"#09224b","icons":[{"src":"./icon-512.png","sizes":"512x512","type":"image/png","purpose":"any"}]}
+{"name":"箱根駅伝予選会 リアルタイム集計","short_name":"予選会集計","start_url":"./","scope":"./","display":"standalone","background_color":"#edf2f9","theme_color":"#09224b","icons":[{"src":"./icon-512.png","sizes":"512x512","type":"image/png"}]}

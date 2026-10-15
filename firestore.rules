@@ -3,10 +3,18 @@ service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
     function validTeam(t) { return t in ['中央学院','東海','神奈川','東洋','日本体育','東京国際','山梨学院','東京農業','大東文化','立教','法政','明治','専修','国士舘']; }
+    function racePath() { return /databases/$(database)/documents/raceControl/main; }
+    function raceIsActive(id) {
+      return exists(racePath())
+        && get(racePath()).data.raceId == id
+        && get(racePath()).data.startedAt is timestamp;
+    }
     match /events/{id} {
       allow read: if signedIn();
       allow create: if signedIn()
-        && request.resource.data.keys().hasOnly(['university','capturedAtMs','localCapturedAtMs','clockOffsetMs','clockOffsetKnown','uid','status','createdAt'])
+        && request.resource.data.keys().hasOnly(['raceId','university','capturedAtMs','localCapturedAtMs','clockOffsetMs','clockOffsetKnown','uid','status','createdAt'])
+        && request.resource.data.raceId is string
+        && raceIsActive(request.resource.data.raceId)
         && validTeam(request.resource.data.university)
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.status == 'active'
@@ -30,6 +38,39 @@ service cloud.firestore {
         && request.resource.data.serverTime == request.time;
       allow read: if signedIn() && resource.data.uid == request.auth.uid;
       allow update, delete: if false;
+    }
+    match /raceControl/{raceId} {
+      allow read: if signedIn();
+      // 初回START。raceIdは毎回ランダムな識別子。
+      allow create: if signedIn() && raceId == 'main'
+        && request.resource.data.keys().hasOnly(['raceId','startedAt','startedBy','createdAt'])
+        && request.resource.data.keys().hasAll(['raceId','startedAt','startedBy','createdAt'])
+        && request.resource.data.raceId is string
+        && request.resource.data.raceId.size() >= 16
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.startedBy == request.auth.uid;
+      // RESET後の再START、または全員によるRESET。
+      allow update: if signedIn() && raceId == 'main' && (
+        (
+          resource.data.startedAt == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['startedAt','startedBy','createdAt'])
+          && request.resource.data.raceId == resource.data.raceId
+          && request.resource.data.startedAt == request.time
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.startedBy == request.auth.uid
+        ) || (
+          resource.data.startedAt is timestamp
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['raceId','startedAt','resetAt','resetBy'])
+          && request.resource.data.raceId is string
+          && request.resource.data.raceId.size() >= 16
+          && request.resource.data.raceId != resource.data.raceId
+          && request.resource.data.startedAt == null
+          && request.resource.data.resetAt == request.time
+          && request.resource.data.resetBy == request.auth.uid
+        )
+      );
+      allow delete: if false;
     }
   }
 }
